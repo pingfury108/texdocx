@@ -1,0 +1,11 @@
+在$\triangle ABC$中，内角$A,B,C$对边分别为$BC=a,CA=b,AB=c$，
+且满足$\cos B=\frac{1}{2}$，$a^2=2b\sqrt{3}$。
+
+（1）求$\triangle ABC$的面积$S$；
+（2）若$b+c=6$，求$a$的值。
+
+$$S=\frac{1}{2}ac\sin B$$
+
+$$\therefore a=2\sqrt{3}$$
+
+小红书号：math_master_2024
