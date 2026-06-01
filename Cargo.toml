@@ -7,10 +7,12 @@ description = "Convert mixed text/LaTeX math documents to DOCX with inline formu
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+axum = "0.8"
 thiserror = "2"
 image = "0.25"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 base64 = "0.22"
 docx-rs = "0.4.20"
 ratex-layout = "0.1.10"

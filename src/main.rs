@@ -1,104 +1,52 @@
 mod cli;
-mod docx;
-mod error;
-mod renderer;
-mod tokenizer;
+mod server;
 
-use crate::docx::RenderedFormula;
-use crate::error::Result;
-use crate::renderer::{
-    cache_key, CachedRenderer, FormulaImage, FormulaMode, FormulaRenderer, RatexRenderer,
-};
-use crate::tokenizer::tokenize;
+use crate::cli::{Command, ConvertArgs};
 use clap::Parser;
 use std::collections::HashMap;
 use std::io::Read;
+use txdx::error::Result;
+use txdx::renderer::FormulaImage;
+use txdx::{convert_to_docx_with_cache, ConvertOptions};
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
         eprintln!("错误: {e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = cli::Cli::parse();
 
-    let input = read_input(&cli.input)?;
-
-    if input.trim().is_empty() {
-        return Err(anyhow::anyhow!("输入内容为空").into());
-    }
-
-    let tokens = tokenize(&input);
-
-    let formula_count = tokens
-        .iter()
-        .filter(|t| {
-            matches!(
-                t,
-                tokenizer::Token::InlineFormula(_) | tokenizer::Token::DisplayFormula(_)
-            )
-        })
-        .count();
-
-    eprintln!(
-        "解析完成: {} 个 token, {} 个公式",
-        tokens.len(),
-        formula_count
-    );
-
-    let cache = load_cache(&cli.cache)?;
-    let ratex = RatexRenderer::new(cli.dpi, cli.font_size);
-    let mut renderer = CachedRenderer::new(ratex, cli.dpi, cli.font_size);
-
-    for (key, image) in &cache {
-        renderer.warm(key, image.clone());
-    }
-
-    let mut new_cache: HashMap<String, FormulaImage> = HashMap::new();
-    let mut images: Vec<RenderedFormula> = Vec::new();
-
-    for token in &tokens {
-        let (formula, mode) = match token {
-            tokenizer::Token::InlineFormula(f) => (f, FormulaMode::Inline),
-            tokenizer::Token::DisplayFormula(f) => (f, FormulaMode::Display),
-            _ => continue,
-        };
-
-        let key = cache_key(formula, mode, cli.dpi, cli.font_size);
-        if images
-            .iter()
-            .any(|item| cache_key(&item.formula, item.mode, cli.dpi, cli.font_size) == key)
-        {
-            continue;
+    match cli.command {
+        Some(Command::Serve(args)) => {
+            server::serve(args.host, args.port).await?;
         }
-
-        eprintln!("渲染公式: ${formula}$");
-        let image = renderer.render(formula, mode)?;
-        images.push(RenderedFormula {
-            formula: formula.clone(),
-            mode,
-            image: image.clone(),
-        });
-        new_cache.insert(key, image);
+        None => {
+            convert_file(cli.convert)?;
+        }
     }
 
-    eprintln!("构建 DOCX 文档...");
-    let docx_data = docx::build_docx_from_tokens(
-        &tokens,
-        &images,
-        cli.dpi,
-        cli.font_size,
-        cli.formula_scale,
-        cli.footer.as_deref(),
-    )?;
+    Ok(())
+}
 
-    std::fs::write(&cli.output, docx_data)?;
+fn convert_file(args: ConvertArgs) -> Result<()> {
+    let input = read_input(&args.input)?;
+    let cache = load_cache(&args.cache)?;
+    let options = ConvertOptions {
+        dpi: args.dpi,
+        font_size: args.font_size,
+        formula_scale: args.formula_scale,
+        footer: args.footer,
+    };
 
-    save_cache(&cli.cache, &new_cache)?;
+    let (docx_data, new_cache) = convert_to_docx_with_cache(&input, &options, cache)?;
+    std::fs::write(&args.output, docx_data)?;
+    save_cache(&args.cache, &new_cache)?;
 
-    eprintln!("完成! 输出文件: {}", cli.output);
+    eprintln!("完成! 输出文件: {}", args.output);
     Ok(())
 }
 

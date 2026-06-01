@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -8,6 +8,21 @@ use clap::Parser;
     long_about = "Converts a document containing plain text and LaTeX math formulas (delimited by $) into a Word .docx file, rendering formulas as high-quality PNG images embedded inline."
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub convert: ConvertArgs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Start the HTTP API server
+    Serve(ServeArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ConvertArgs {
     /// Input file (text with $formula$ markup). Reads from stdin if omitted.
     pub input: Option<String>,
 
@@ -34,4 +49,15 @@ pub struct Cli {
     /// Path to a JSON cache file for formula images (speeds up re-runs)
     #[arg(long)]
     pub cache: Option<String>,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ServeArgs {
+    /// Host address to bind
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Port to listen on
+    #[arg(short = 'p', long, default_value = "3000")]
+    pub port: u16,
 }
