@@ -54,7 +54,7 @@ pub struct ConvertArgs {
 #[derive(Parser, Debug, Clone)]
 pub struct ServeArgs {
     /// Host address to bind
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     pub host: String,
 
     /// Port to listen on
