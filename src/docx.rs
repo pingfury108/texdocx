@@ -1,365 +1,143 @@
 use crate::error::Result;
+use crate::renderer::{cache_key, FormulaImage, FormulaMode};
 use crate::tokenizer::Token;
-use std::io::{Cursor, Write};
+use docx_rs::{AlignmentType, BreakType, Docx, Paragraph, Pic, Run, RunFonts};
+use std::collections::HashMap;
+use std::io::{Cursor, Read, Write};
 use zip::write::FileOptions;
-use zip::ZipWriter;
+use zip::{ZipArchive, ZipWriter};
 
-pub enum ParagraphRun {
+const INLINE_FORMULA_MARKER: &str = "txdx_formula_inline";
+const INLINE_FORMULA_POSITION: i16 = -6;
+
+pub struct RenderedFormula {
+    pub formula: String,
+    pub mode: FormulaMode,
+    pub image: FormulaImage,
+}
+
+enum ParagraphRun {
     Text(String),
-    Image {
-        data: Vec<u8>,
-        width_pt: f64,
-        height_pt: f64,
-    },
+    InlineImage(FormulaImage),
     LineBreak,
 }
 
-struct ImageEntry {
-    data: Vec<u8>,
-    filename: String,
-    rid: String,
-}
-
-pub struct DocxBuilder {
-    body_xml: String,
-    images: Vec<ImageEntry>,
-    image_counter: usize,
+struct DocxBuilder {
+    docx: Docx,
     font_size: u16,
     formula_scale: f64,
-    has_footer: bool,
-    footer_text: String,
+    footer_text: Option<String>,
+    inline_image_counter: usize,
 }
 
 impl DocxBuilder {
-    pub fn new(_dpi: u32) -> Self {
+    fn new(_dpi: u32) -> Self {
         Self {
-            body_xml: String::new(),
-            images: Vec::new(),
-            image_counter: 0,
+            docx: Docx::new().default_fonts(body_fonts()).default_size(24),
             font_size: 24,
             formula_scale: 1.0,
-            has_footer: false,
-            footer_text: String::new(),
+            footer_text: None,
+            inline_image_counter: 0,
         }
     }
 
-    pub fn with_font_size(mut self, size: u16) -> Self {
+    fn with_font_size(mut self, size: u16) -> Self {
         self.font_size = size;
+        self.docx = self.docx.default_size(size as usize);
         self
     }
 
-    pub fn with_formula_scale(mut self, scale: f64) -> Self {
+    fn with_formula_scale(mut self, scale: f64) -> Self {
         self.formula_scale = scale;
         self
     }
 
-    fn position_offset(&self) -> i16 {
-        -((self.font_size as i16) / 6)
-    }
-
     fn pt_to_emu(&self, pt: f64) -> u32 {
-        (pt * 12700.0 * self.formula_scale) as u32
+        (pt * 12700.0 * self.formula_scale).round() as u32
     }
 
-    pub fn add_mixed_paragraph(&mut self, runs: Vec<ParagraphRun>) {
+    fn text_run(&self, text: String) -> Run {
+        Run::new()
+            .add_text(text)
+            .fonts(body_fonts())
+            .size(self.font_size as usize)
+    }
+
+    fn image_run(&mut self, image: FormulaImage, inline: bool) -> Run {
+        let mut pic = Pic::new(&image.data).size(
+            self.pt_to_emu(image.width_pt),
+            self.pt_to_emu(image.height_pt),
+        );
+
+        if inline {
+            self.inline_image_counter += 1;
+            pic = pic.id(format!(
+                "{INLINE_FORMULA_MARKER}_{}",
+                self.inline_image_counter
+            ));
+        }
+
+        Run::new().add_image(pic)
+    }
+
+    fn add_mixed_paragraph(&mut self, runs: Vec<ParagraphRun>) {
         if runs.iter().all(|r| matches!(r, ParagraphRun::LineBreak)) {
             return;
         }
-        self.body_xml.push_str("    <w:p>\n");
 
+        let mut paragraph = Paragraph::new();
         for run in runs {
-            match run {
-                ParagraphRun::Text(text) => {
-                    let escaped = escape_xml(&text);
-                    self.body_xml.push_str(&format!(
-                        r#"      <w:r>
-        <w:rPr>
-          <w:rFonts w:eastAsia="SimSun"/>
-          <w:sz w:val="{}"/>
-        </w:rPr>
-        <w:t xml:space="preserve">{}</w:t>
-      </w:r>
-"#,
-                        self.font_size, escaped
-                    ));
-                }
+            paragraph = match run {
+                ParagraphRun::Text(text) => paragraph.add_run(self.text_run(text)),
                 ParagraphRun::LineBreak => {
-                    self.body_xml.push_str("      <w:r><w:br/></w:r>\n");
+                    paragraph.add_run(Run::new().add_break(BreakType::TextWrapping))
                 }
-                ParagraphRun::Image {
-                    data,
-                    width_pt,
-                    height_pt,
-                } => {
-                    self.image_counter += 1;
-                    let rid = format!("rId{}", self.image_counter);
-                    let filename = format!("media/image{}.png", self.image_counter);
-
-                    let width_emu = self.pt_to_emu(width_pt);
-                    let height_emu = self.pt_to_emu(height_pt);
-                    let pos = self.position_offset();
-
-                    self.body_xml.push_str(&format!(
-                        r#"      <w:r>
-        <w:rPr>
-          <w:position w:val="{pos}"/>
-        </w:rPr>
-        <w:drawing>
-          <wp:inline distT="0" distB="0" distL="0" distR="0">
-            <wp:extent cx="{cx}" cy="{cy}"/>
-            <wp:effectExtent l="0" t="0" r="0" b="0"/>
-            <wp:docPr id="{id}" name="formula_{id}"/>
-            <a:graphic>
-              <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
-                <pic:pic>
-                  <pic:nvPicPr>
-                    <pic:cNvPr id="0" name="formula_{id}"/>
-                    <pic:cNvPicPr/>
-                  </pic:nvPicPr>
-                  <pic:blipFill>
-                    <a:blip r:embed="{rid}"/>
-                    <a:stretch>
-                      <a:fillRect/>
-                    </a:stretch>
-                  </pic:blipFill>
-                  <pic:spPr>
-                    <a:xfrm>
-                      <a:off x="0" y="0"/>
-                      <a:ext cx="{cx}" cy="{cy}"/>
-                    </a:xfrm>
-                    <a:prstGeom prst="rect"/>
-                  </pic:spPr>
-                </pic:pic>
-              </a:graphicData>
-            </a:graphic>
-          </wp:inline>
-        </w:drawing>
-      </w:r>
-"#,
-                        pos = pos,
-                        cx = width_emu,
-                        cy = height_emu,
-                        id = self.image_counter,
-                        rid = rid,
-                    ));
-
-                    self.images.push(ImageEntry {
-                        data,
-                        filename,
-                        rid,
-                    });
-                }
-            }
+                ParagraphRun::InlineImage(image) => paragraph.add_run(self.image_run(image, true)),
+            };
         }
 
-        self.body_xml.push_str("    </w:p>\n");
+        self.docx = std::mem::take(&mut self.docx).add_paragraph(paragraph);
     }
 
-    pub fn add_display_formula_paragraph(&mut self, image_data: Vec<u8>, width_pt: f64, height_pt: f64) {
-        self.image_counter += 1;
-        let rid = format!("rId{}", self.image_counter);
-        let filename = format!("media/image{}.png", self.image_counter);
-
-        let width_emu = self.pt_to_emu(width_pt);
-        let height_emu = self.pt_to_emu(height_pt);
-
-        self.body_xml.push_str(&format!(
-            r#"    <w:p>
-      <w:pPr>
-        <w:jc w:val="center"/>
-      </w:pPr>
-      <w:r>
-        <w:drawing>
-          <wp:inline distT="0" distB="0" distL="0" distR="0">
-            <wp:extent cx="{cx}" cy="{cy}"/>
-            <wp:effectExtent l="0" t="0" r="0" b="0"/>
-            <wp:docPr id="{id}" name="formula_{id}"/>
-            <a:graphic>
-              <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
-                <pic:pic>
-                  <pic:nvPicPr>
-                    <pic:cNvPr id="0" name="formula_{id}"/>
-                    <pic:cNvPicPr/>
-                  </pic:nvPicPr>
-                  <pic:blipFill>
-                    <a:blip r:embed="{rid}"/>
-                    <a:stretch>
-                      <a:fillRect/>
-                    </a:stretch>
-                  </pic:blipFill>
-                  <pic:spPr>
-                    <a:xfrm>
-                      <a:off x="0" y="0"/>
-                      <a:ext cx="{cx}" cy="{cy}"/>
-                    </a:xfrm>
-                    <a:prstGeom prst="rect"/>
-                  </pic:spPr>
-                </pic:pic>
-              </a:graphicData>
-            </a:graphic>
-          </wp:inline>
-        </w:drawing>
-      </w:r>
-    </w:p>
-"#,
-            cx = width_emu,
-            cy = height_emu,
-            id = self.image_counter,
-            rid = rid,
-        ));
-
-        self.images.push(ImageEntry {
-            data: image_data,
-            filename,
-            rid,
-        });
+    fn add_display_formula_paragraph(&mut self, image: FormulaImage) {
+        let paragraph = Paragraph::new()
+            .align(AlignmentType::Center)
+            .add_run(self.image_run(image, false));
+        self.docx = std::mem::take(&mut self.docx).add_paragraph(paragraph);
     }
 
-    pub fn add_footer(&mut self, text: &str) {
-        self.has_footer = true;
-        self.footer_text = text.to_string();
+    fn add_footer(&mut self, text: &str) {
+        self.footer_text = Some(text.to_string());
     }
 
-    pub fn build(self) -> Result<Vec<u8>> {
+    fn build(mut self) -> Result<Vec<u8>> {
+        if let Some(text) = self.footer_text {
+            let paragraph = Paragraph::new().add_run(
+                Run::new()
+                    .add_text(text)
+                    .fonts(body_fonts())
+                    .size(16)
+                    .color("808080"),
+            );
+            self.docx = self.docx.add_paragraph(paragraph);
+        }
+
         let mut buf = Cursor::new(Vec::new());
-        {
-            let mut zip = ZipWriter::new(&mut buf);
-            let options = FileOptions::<()>::default()
-                .compression_method(zip::CompressionMethod::Deflated);
-
-            zip.start_file("[Content_Types].xml", options)?;
-            zip.write_all(generate_content_types(&self.images).as_bytes())?;
-
-            zip.start_file("_rels/.rels", options)?;
-            zip.write_all(generate_rels().as_bytes())?;
-
-            zip.start_file("word/_rels/document.xml.rels", options)?;
-            zip.write_all(generate_document_rels(&self.images).as_bytes())?;
-
-            zip.start_file("word/document.xml", options)?;
-            zip.write_all(generate_document_xml(&self.body_xml, self.has_footer, &self.footer_text).as_bytes())?;
-
-            for img in &self.images {
-                zip.start_file(format!("word/{}", img.filename), options)?;
-                zip.write_all(&img.data)?;
-            }
-
-            zip.finish()?;
-        }
-        Ok(buf.into_inner())
+        self.docx
+            .build()
+            .pack(&mut buf)
+            .map_err(|e| anyhow::anyhow!("DOCX 打包失败: {e}"))?;
+        patch_inline_formula_position(buf.into_inner(), INLINE_FORMULA_POSITION)
     }
 }
 
-fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn generate_content_types(images: &[ImageEntry]) -> String {
-    let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Default Extension="png" ContentType="image/png"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-"#,
-    );
-
-    for img in images {
-        xml.push_str(&format!(
-            r#"  <Override PartName="/word/{}" ContentType="image/png"/>
-"#,
-            img.filename
-        ));
-    }
-
-    xml.push_str("</Types>");
-    xml
-}
-
-fn generate_rels() -> String {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId0" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>"#
-        .to_string()
-}
-
-fn generate_document_rels(images: &[ImageEntry]) -> String {
-    let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-"#,
-    );
-
-    for img in images {
-        xml.push_str(&format!(
-            r#"  <Relationship Id="{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{}"/>
-"#,
-            img.rid, img.filename
-        ));
-    }
-
-    xml.push_str("</Relationships>");
-    xml
-}
-
-fn generate_document_xml(body: &str, has_footer: bool, footer_text: &str) -> String {
-    let mut xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
-            xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-            xmlns:o="urn:schemas-microsoft-com:office:office"
-            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-            xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
-            xmlns:v="urn:schemas-microsoft-com:vml"
-            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-            xmlns:w10="urn:schemas-microsoft-com:office:word"
-            xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-            xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml"
-            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
-            xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
-  <w:body>
-{}
-  </w:body>
-</w:document>"#,
-        body
-    );
-
-    if has_footer {
-        let escaped = escape_xml(footer_text);
-        let footer_para = format!(
-            r#"    <w:p>
-      <w:pPr>
-        <w:rPr>
-          <w:color w:val="808080"/>
-          <w:sz w:val="16"/>
-        </w:rPr>
-      </w:pPr>
-      <w:r>
-        <w:rPr>
-          <w:color w:val="808080"/>
-          <w:sz w:val="16"/>
-        </w:rPr>
-        <w:t xml:space="preserve">{}</w:t>
-      </w:r>
-    </w:p>
-"#,
-            escaped
-        );
-        xml = xml.replace("  </w:body>", &format!("{}\n  </w:body>", footer_para));
-    }
-
-    xml
+fn body_fonts() -> RunFonts {
+    RunFonts::new().east_asia("SimSun")
 }
 
 pub fn build_docx_from_tokens(
     tokens: &[Token],
-    images: &[(String, Vec<u8>, f64, f64)],
+    images: &[RenderedFormula],
     dpi: u32,
     font_size: u16,
     formula_scale: f64,
@@ -373,25 +151,23 @@ pub fn build_docx_from_tokens(
         builder.add_footer(footer_text);
     }
 
-    let image_map: std::collections::HashMap<&str, (f64, f64)> = {
-        let mut m = std::collections::HashMap::new();
-        for (formula, _data, w, h) in images {
-            m.insert(formula.as_str(), (*w, *h));
-        }
-        m
-    };
-
-    let image_data_map: std::collections::HashMap<&str, &Vec<u8>> =
-        images.iter().map(|(k, v, _, _)| (k.as_str(), v)).collect();
+    let image_map: HashMap<String, FormulaImage> = images
+        .iter()
+        .map(|item| {
+            (
+                cache_key(&item.formula, item.mode, dpi, font_size),
+                item.image.clone(),
+            )
+        })
+        .collect();
 
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
             Token::DisplayFormula(formula) => {
-                if let Some((w, h)) = image_map.get(formula.as_str()) {
-                    if let Some(data) = image_data_map.get(formula.as_str()) {
-                        builder.add_display_formula_paragraph((*data).clone(), *w, *h);
-                    }
+                let key = cache_key(formula, FormulaMode::Display, dpi, font_size);
+                if let Some(image) = image_map.get(&key) {
+                    builder.add_display_formula_paragraph(image.clone());
                 }
                 i += 1;
             }
@@ -413,15 +189,10 @@ pub fn build_docx_from_tokens(
                             }
                             i += 1;
                         }
-                        Token::InlineFormula(f) => {
-                            if let Some((w, h)) = image_map.get(f.as_str()) {
-                                if let Some(data) = image_data_map.get(f.as_str()) {
-                                    runs.push(ParagraphRun::Image {
-                                        data: (*data).clone(),
-                                        width_pt: *w,
-                                        height_pt: *h,
-                                    });
-                                }
+                        Token::InlineFormula(formula) => {
+                            let key = cache_key(formula, FormulaMode::Inline, dpi, font_size);
+                            if let Some(image) = image_map.get(&key) {
+                                runs.push(ParagraphRun::InlineImage(image.clone()));
                             }
                             i += 1;
                         }
@@ -451,4 +222,119 @@ fn append_text_with_linebreaks(runs: &mut Vec<ParagraphRun>, text: &str) {
             runs.push(ParagraphRun::Text(line.to_string()));
         }
     }
+}
+
+fn patch_inline_formula_position(docx: Vec<u8>, position: i16) -> Result<Vec<u8>> {
+    let mut input =
+        ZipArchive::new(Cursor::new(docx)).map_err(|e| anyhow::anyhow!("DOCX 读取失败: {e}"))?;
+    let mut output = Cursor::new(Vec::new());
+
+    {
+        let mut writer = ZipWriter::new(&mut output);
+        for i in 0..input.len() {
+            let mut file = input
+                .by_index(i)
+                .map_err(|e| anyhow::anyhow!("DOCX 条目读取失败: {e}"))?;
+            let name = file.name().to_string();
+            let options = FileOptions::<()>::default().compression_method(file.compression());
+
+            if file.is_dir() {
+                writer
+                    .add_directory(name, options)
+                    .map_err(|e| anyhow::anyhow!("DOCX 目录写入失败: {e}"))?;
+                continue;
+            }
+
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+
+            if name == "word/document.xml" {
+                let xml = String::from_utf8(data)
+                    .map_err(|e| anyhow::anyhow!("document.xml 不是有效 UTF-8: {e}"))?;
+                data = patch_document_xml(&xml, position).into_bytes();
+            }
+
+            writer
+                .start_file(name, options)
+                .map_err(|e| anyhow::anyhow!("DOCX 条目写入失败: {e}"))?;
+            writer.write_all(&data)?;
+        }
+
+        writer
+            .finish()
+            .map_err(|e| anyhow::anyhow!("DOCX 写入完成失败: {e}"))?;
+    }
+
+    Ok(output.into_inner())
+}
+
+fn patch_document_xml(xml: &str, position: i16) -> String {
+    let mut output = String::with_capacity(xml.len() + 64);
+    let mut cursor = 0;
+
+    while let Some(marker_offset) = xml[cursor..].find(INLINE_FORMULA_MARKER) {
+        let marker = cursor + marker_offset;
+        let Some(run_start_rel) = xml[..marker].rfind("<w:r") else {
+            break;
+        };
+        let Some(run_end_rel) = xml[marker..].find("</w:r>") else {
+            break;
+        };
+        let run_end = marker + run_end_rel + "</w:r>".len();
+
+        if run_start_rel < cursor {
+            cursor = marker + INLINE_FORMULA_MARKER.len();
+            continue;
+        }
+
+        output.push_str(&xml[cursor..run_start_rel]);
+        output.push_str(&patch_run_position(&xml[run_start_rel..run_end], position));
+        cursor = run_end;
+    }
+
+    output.push_str(&xml[cursor..]);
+    output
+}
+
+fn patch_run_position(run_xml: &str, position: i16) -> String {
+    if run_xml.contains("<w:position ") {
+        return run_xml.to_string();
+    }
+
+    let position_xml = format!(r#"<w:position w:val="{position}"/>"#);
+
+    if let Some(rpr_start) = run_xml.find("<w:rPr") {
+        let Some(start_tag_end_rel) = run_xml[rpr_start..].find('>') else {
+            return run_xml.to_string();
+        };
+        let start_tag_end = rpr_start + start_tag_end_rel;
+
+        if run_xml[..=start_tag_end].ends_with("/>") {
+            let mut patched = String::with_capacity(run_xml.len() + position_xml.len() + 8);
+            patched.push_str(&run_xml[..start_tag_end - 1]);
+            patched.push('>');
+            patched.push_str(&position_xml);
+            patched.push_str("</w:rPr>");
+            patched.push_str(&run_xml[start_tag_end + 1..]);
+            return patched;
+        }
+
+        let mut patched = String::with_capacity(run_xml.len() + position_xml.len());
+        patched.push_str(&run_xml[..start_tag_end + 1]);
+        patched.push_str(&position_xml);
+        patched.push_str(&run_xml[start_tag_end + 1..]);
+        return patched;
+    }
+
+    let Some(run_start_end) = run_xml.find('>') else {
+        return run_xml.to_string();
+    };
+
+    let mut patched = String::with_capacity(run_xml.len() + position_xml.len() + 16);
+    patched.push_str(&run_xml[..run_start_end + 1]);
+    patched.push_str("<w:rPr>");
+    patched.push_str(&position_xml);
+    patched.push_str("</w:rPr>");
+    patched.push_str(&run_xml[run_start_end + 1..]);
+    patched
 }

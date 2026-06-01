@@ -1,238 +1,143 @@
 use crate::error::{Result, TxdxError};
-use sha2::{Digest, Sha256};
+use image::GenericImageView;
+use ratex_layout::{layout, to_display_list, LayoutOptions};
+use ratex_parser::parser::parse;
+use ratex_render::{render_to_png, RenderOptions};
+use ratex_types::color::Color;
+use ratex_types::math_style::MathStyle;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
-use std::process::Command;
-use tempfile::TempDir;
 
-pub trait FormulaRenderer {
-    fn render(&mut self, formula: &str) -> Result<(Vec<u8>, f64, f64)>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FormulaMode {
+    Inline,
+    Display,
 }
 
-pub struct PdflatexRenderer {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormulaImage {
+    pub data: Vec<u8>,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+pub trait FormulaRenderer {
+    fn render(&mut self, formula: &str, mode: FormulaMode) -> Result<FormulaImage>;
+}
+
+pub struct RatexRenderer {
     dpi: u32,
     font_size: u16,
 }
 
-impl PdflatexRenderer {
+impl RatexRenderer {
     pub fn new(dpi: u32, font_size: u16) -> Self {
         Self { dpi, font_size }
     }
 
-    fn hash_formula(formula: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(formula.as_bytes());
-        format!("{:x}", hasher.finalize())[..16].to_string()
+    fn dpr(&self) -> f32 {
+        (self.dpi as f32 / 96.0).clamp(0.25, 8.0)
     }
 
-    fn latex_pt(&self) -> u16 {
-        self.font_size / 2
+    fn font_size_px(&self) -> f32 {
+        let pt = self.font_size as f32 / 2.0;
+        pt * 96.0 / 72.0
+    }
+
+    fn px_to_pt(&self, px: u32) -> f64 {
+        px as f64 / self.dpr() as f64 * 72.0 / 96.0
     }
 }
 
-impl Default for PdflatexRenderer {
+impl Default for RatexRenderer {
     fn default() -> Self {
-        Self::new(300, 24)
+        Self::new(200, 24)
     }
 }
 
-impl FormulaRenderer for PdflatexRenderer {
-    fn render(&mut self, formula: &str) -> Result<(Vec<u8>, f64, f64)> {
-        let tmp = TempDir::new().map_err(TxdxError::Io)?;
-        let base = tmp.path().join(Self::hash_formula(formula));
+impl FormulaRenderer for RatexRenderer {
+    fn render(&mut self, formula: &str, mode: FormulaMode) -> Result<FormulaImage> {
+        let ast = parse(formula).map_err(|e| TxdxError::FormulaRender {
+            formula: formula.to_string(),
+            message: format!("RaTeX parse error: {e}"),
+        })?;
 
-        let tex_path = base.with_extension("tex");
-        let pdf_path = base.with_extension("pdf");
-        let png_path = base.with_extension("png");
+        let style = match mode {
+            FormulaMode::Inline => MathStyle::Text,
+            FormulaMode::Display => MathStyle::Display,
+        };
+        let layout_options = LayoutOptions::default().with_style(style);
+        let layout_box = layout(&ast, &layout_options);
+        let display_list = to_display_list(&layout_box);
 
-        let tex_content = format!(
-            r#"\documentclass[preview, border=1pt, {pt}pt]{{standalone}}
-\usepackage{{amsmath,amssymb,amsfonts,mathrsfs}}
-\usepackage{{bm}}
-\usepackage{{upgreek}}
-\begin{{document}}
-$\displaystyle {formula}$
-\end{{document}}"#,
-            pt = self.latex_pt(),
-            formula = formula,
-        );
+        let render_options = RenderOptions {
+            font_size: self.font_size_px(),
+            padding: 1.0,
+            background_color: Color::new(0.0, 0.0, 0.0, 0.0),
+            font_dir: String::new(),
+            device_pixel_ratio: self.dpr(),
+        };
 
-        std::fs::write(&tex_path, tex_content)?;
-
-        let output = Command::new("pdflatex")
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                &tex_path.to_string_lossy(),
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .map_err(TxdxError::Io)?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(TxdxError::LatexCompile {
+        let data = render_to_png(&display_list, &render_options).map_err(|e| {
+            TxdxError::FormulaRender {
                 formula: formula.to_string(),
-                stderr: format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
-            });
-        }
-
-        if !pdf_path.exists() {
-            return Err(TxdxError::LatexCompile {
-                formula: formula.to_string(),
-                stderr: "PDF was not generated".to_string(),
-            });
-        }
-
-        let (width_pt, height_pt) = get_pdf_dimensions(&pdf_path)?;
-
-        pdf_to_png(&pdf_path, &png_path, self.dpi)?;
-
-        let png_bytes = std::fs::read(&png_path)?;
-        Ok((png_bytes, width_pt, height_pt))
-    }
-}
-
-fn get_pdf_dimensions(pdf: &Path) -> Result<(f64, f64)> {
-    let output = Command::new("pdfinfo")
-        .arg(pdf)
-        .output();
-
-    if let Ok(o) = output {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            for line in stdout.lines() {
-                if let Some(rest) = line.strip_prefix("Page size:") {
-                    let parts: Vec<&str> = rest.trim().split_whitespace().collect();
-                    if parts.len() >= 3 {
-                        let w: f64 = parts[0].parse().unwrap_or(0.0);
-                        let h: f64 = parts[2].parse().unwrap_or(0.0);
-                        if w > 0.0 && h > 0.0 {
-                            return Ok((w, h));
-                        }
-                    }
-                }
+                message: format!("RaTeX render error: {e}"),
             }
-        }
+        })?;
+
+        let image = image::load_from_memory(&data).map_err(|e| TxdxError::FormulaRender {
+            formula: formula.to_string(),
+            message: format!("PNG decode error: {e}"),
+        })?;
+        let (width_px, height_px) = image.dimensions();
+
+        Ok(FormulaImage {
+            data,
+            width_pt: self.px_to_pt(width_px),
+            height_pt: self.px_to_pt(height_px),
+        })
     }
-
-    let data = std::fs::read(pdf)?;
-    for i in 0..data.len().saturating_sub(20) {
-        if &data[i..i+9] == b"/MediaBox" {
-            let slice = &data[i..];
-            if let Some(start) = slice.iter().position(|&b| b == b'[') {
-                let inner = &slice[start+1..];
-                if let Some(end) = inner.iter().position(|&b| b == b']') {
-                    let nums: Vec<f64> = std::str::from_utf8(&inner[..end])
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .filter_map(|s| s.parse().ok())
-                        .collect();
-                    if nums.len() >= 4 {
-                        return Ok((nums[2] - nums[0], nums[3] - nums[1]));
-                    }
-                }
-            }
-        }
-    }
-
-    Err(TxdxError::Anyhow(anyhow::anyhow!(
-        "无法读取 PDF 页面尺寸，请安装 pdfinfo (poppler-utils)"
-    )))
-}
-
-fn pdf_to_png(pdf: &Path, png: &Path, dpi: u32) -> Result<()> {
-    let stem = png.with_extension("");
-
-    // pdftoppm — best quality, respects DPI
-    let output = Command::new("pdftoppm")
-        .args([
-            "-png",
-            "-r",
-            &dpi.to_string(),
-            "-singlefile",
-            &pdf.to_string_lossy(),
-            &stem.to_string_lossy(),
-        ])
-        .output();
-
-    if let Ok(o) = output {
-        if o.status.success() {
-            return Ok(());
-        }
-    }
-
-    // Ghostscript — good quality, respects DPI
-    let output = Command::new("gs")
-        .args([
-            "-dSAFER",
-            "-dBATCH",
-            "-dNOPAUSE",
-            "-dTextAlphaBits=4",
-            "-dGraphicsAlphaBits=4",
-            "-sDEVICE=png16m",
-            &format!("-r{dpi}"),
-            &format!("-sOutputFile={}", png.to_string_lossy()),
-            &pdf.to_string_lossy(),
-        ])
-        .output();
-
-    if let Ok(o) = output {
-        if o.status.success() {
-            return Ok(());
-        }
-    }
-
-    // sips — macOS built-in, 72 DPI only, low quality fallback
-    #[cfg(target_os = "macos")]
-    {
-        let result = Command::new("sips")
-            .args([
-                "-s", "format", "png",
-                &pdf.to_string_lossy(),
-                "--out", &png.to_string_lossy(),
-            ])
-            .output();
-
-        if let Ok(output) = result {
-            if output.status.success() {
-                return Ok(());
-            }
-        }
-    }
-
-    Err(TxdxError::NoPdfConverter)
 }
 
 pub struct CachedRenderer<R: FormulaRenderer> {
     inner: R,
-    cache: HashMap<String, (Vec<u8>, f64, f64)>,
+    cache: HashMap<String, FormulaImage>,
+    dpi: u32,
+    font_size: u16,
 }
 
 impl<R: FormulaRenderer> CachedRenderer<R> {
-    pub fn new(inner: R) -> Self {
+    pub fn new(inner: R, dpi: u32, font_size: u16) -> Self {
         Self {
             inner,
             cache: HashMap::new(),
+            dpi,
+            font_size,
         }
     }
 
-    pub fn warm(&mut self, key: &str, data: Vec<u8>) {
-        self.cache
-            .insert(key.to_string(), (data, 100.0, 20.0));
+    pub fn warm(&mut self, key: &str, image: FormulaImage) {
+        self.cache.insert(key.to_string(), image);
     }
 }
 
 impl<R: FormulaRenderer> FormulaRenderer for CachedRenderer<R> {
-    fn render(&mut self, formula: &str) -> Result<(Vec<u8>, f64, f64)> {
-        let key = formula.to_string();
-        if let Some(data) = self.cache.get(&key) {
-            return Ok(data.clone());
+    fn render(&mut self, formula: &str, mode: FormulaMode) -> Result<FormulaImage> {
+        let key = cache_key(formula, mode, self.dpi, self.font_size);
+        if let Some(image) = self.cache.get(&key) {
+            return Ok(image.clone());
         }
 
-        let result = self.inner.render(formula)?;
+        let result = self.inner.render(formula, mode)?;
         self.cache.insert(key, result.clone());
         Ok(result)
     }
+}
+
+pub fn cache_key(formula: &str, mode: FormulaMode, dpi: u32, font_size: u16) -> String {
+    let mode = match mode {
+        FormulaMode::Inline => "inline",
+        FormulaMode::Display => "display",
+    };
+    format!("ratex:dpi={dpi}:font_size={font_size}:mode={mode}:{formula}")
 }
