@@ -135,6 +135,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     button {
       min-width: 132px;
       height: 40px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
       border: 0;
       border-radius: 6px;
       background: #1f883d;
@@ -146,6 +150,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
     button:disabled {
       cursor: wait;
       opacity: 0.65;
+    }
+    button.is-loading {
+      opacity: 0.85;
+    }
+    button.is-loading::before {
+      content: "";
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255, 255, 255, 0.55);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
     }
     .secondary {
       background: #0969da;
@@ -184,8 +205,8 @@ $$S=\frac{1}{2}ac\sin B$$
 
 $$\therefore a=2\sqrt{3}$$</textarea>
     <div class="actions">
-      <button id="previewBtn" class="secondary">预览 DOCX</button>
-      <button id="downloadBtn">下载 DOCX</button>
+      <button id="previewBtn" class="secondary" data-default-text="预览 DOCX" data-loading-text="预览中...">预览 DOCX</button>
+      <button id="downloadBtn" data-default-text="下载 DOCX" data-loading-text="下载中...">下载 DOCX</button>
     </div>
     <div id="preview" class="preview"></div>
   </main>
@@ -228,9 +249,16 @@ $$\therefore a=2\sqrt{3}$$</textarea>
       return latestBlob;
     }
 
-    function setBusy(isBusy) {
+    function setBusy(activeButton) {
+      const isBusy = Boolean(activeButton);
       previewBtn.disabled = isBusy;
       downloadBtn.disabled = isBusy;
+
+      for (const button of [previewBtn, downloadBtn]) {
+        const isLoading = button === activeButton;
+        button.classList.toggle('is-loading', isLoading);
+        button.textContent = isLoading ? button.dataset.loadingText : button.dataset.defaultText;
+      }
     }
 
     function downloadBlob(blob) {
@@ -245,7 +273,7 @@ $$\therefore a=2\sqrt{3}$$</textarea>
     }
 
     previewBtn.addEventListener('click', async () => {
-      setBusy(true);
+      setBusy(previewBtn);
       statusEl.textContent = '生成预览中...';
 
       try {
@@ -261,12 +289,12 @@ $$\therefore a=2\sqrt{3}$$</textarea>
       } catch (err) {
         statusEl.textContent = err.message || '生成失败';
       } finally {
-        setBusy(false);
+        setBusy(null);
       }
     });
 
     downloadBtn.addEventListener('click', async () => {
-      setBusy(true);
+      setBusy(downloadBtn);
       statusEl.textContent = '生成中...';
 
       try {
@@ -276,7 +304,7 @@ $$\therefore a=2\sqrt{3}$$</textarea>
       } catch (err) {
         statusEl.textContent = err.message || '生成失败';
       } finally {
-        setBusy(false);
+        setBusy(null);
       }
     });
   </script>
